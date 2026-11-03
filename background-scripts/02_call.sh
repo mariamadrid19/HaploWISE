@@ -19,7 +19,7 @@ BASE_DIR="/scratch/leuven/357/vsc35707/popgen"
 
 cd "$BASE_DIR"
 
-THREADS="${SLURM_CPUS_PER_TASK:-36}"
+THREADS="${SLURM_CPUS_PER_TASK:-12}"
 ID=$((SLURM_ARRAY_TASK_ID - 1))
 
 # Environment
@@ -204,257 +204,118 @@ echo "SNP-only VCF created."
 TMPDIR_SAMPLE="${BASE_DIR}/tmp_call_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
 
 mkdir -p "$TMPDIR_SAMPLE"
+trap 'status=$?; if [[ $status -eq 0 ]]; then rm -rf -- "$TMPDIR_SAMPLE"; else echo "Temporary files retained: $TMPDIR_SAMPLE" >&2; fi' EXIT
 
 HELPER="${TMPDIR_SAMPLE}/process_genotypes.py"
 
 cat > "$HELPER" <<'PYTHON'
-
 #!/usr/bin/env python3
-
 import argparse
-import sys
 from itertools import zip_longest
-
 import pysam
 
 
-def variant_key(record):
-    return (
-        record.contig,
-        record.pos,
-        record.ref,
-        tuple(record.alts or ())
-    )
+def key(rec):
+    return (rec.contig, rec.pos, rec.ref, tuple(rec.alts or ()))
 
 
-def is_missing(gt):
+def missing(gt):
     return gt is None or any(a is None for a in gt)
 
 
-def filter_genotypes(input_file, output_file, min_dp, min_gq):
-
-    invcf = pysam.VariantFile(input_file)
-    outvcf = pysam.VariantFile(
-        output_file,
-        "wz",
-        header=invcf.header
-    )
-
-    samples = list(invcf.header.samples)
-
-    total_genotypes = 0
-    masked_dp = 0
-    masked_gq = 0
-    already_missing = 0
-
-    for record in invcf:
-
-        for sample_name in samples:
-
-            call = record.samples[sample_name]
-            gt = call.get("GT")
-
-            total_genotypes += 1
-
-            if is_missing(gt):
-                already_missing += 1
-                continue
-
-            dp = call.get("DP")
-
-            # DP filtering applies to every genotype.
-            if dp is None or dp < min_dp:
-
-                call["GT"] = tuple(None for _ in gt)
-                call.phased = False
-
-                masked_dp += 1
-                continue
-
-            # Apply GQ threshold to heterozygous
-            # and homozygous-alternative genotypes.
-            #
-            # Homozygous-reference genotypes are not
-            # filtered on GQ, matching the original
-            # parseVCF.py filtering logic.
-
-            is_hom_ref = all(a == 0 for a in gt)
-
-            if not is_hom_ref:
-
-                gq = call.get("GQ")
-
-                if gq is None or gq < min_gq:
-
-                    call["GT"] = tuple(None for _ in gt)
-                    call.phased = False
-
-                    masked_gq += 1
-
-        outvcf.write(record)
-
-    invcf.close()
-    outvcf.close()
-
-    print("Genotype filtering completed.")
-    print(f"Total genotypes: {total_genotypes}")
-    print(f"Already missing: {already_missing}")
-    print(f"Masked due to DP: {masked_dp}")
-    print(f"Masked due to GQ: {masked_gq}")
-    print(
-        "Total missing after filtering: "
-        f"{already_missing + masked_dp + masked_gq}"
-    )
-
-
-def restore_missingness(filtered_file, phased_file, output_file):
-
-    original = pysam.VariantFile(filtered_file)
-    phased = pysam.VariantFile(phased_file)
-
-    original_samples = list(original.header.samples)
-    phased_samples = list(phased.header.samples)
-
-    # Verify sample identities and order.
-    if original_samples != phased_samples:
-        raise RuntimeError(
-            "Sample names or sample order differ between "
-            "filtered VCF and Beagle VCF."
-        )
-
-    outvcf = pysam.VariantFile(
-        output_file,
-        "wz",
-        header=phased.header
-    )
-
-    restored = 0
-    retained = 0
-    n_variants = 0
-
-    for original_record, phased_record in zip_longest(
-        original,
-        phased
-    ):
-
-        if original_record is None or phased_record is None:
-            raise RuntimeError(
-                "Filtered and phased VCFs have different "
-                "numbers of variant records."
-            )
-
-        if variant_key(original_record) != variant_key(phased_record):
-            raise RuntimeError(
-                "Variant mismatch between filtered and phased VCFs: "
-                f"{variant_key(original_record)} vs "
-                f"{variant_key(phased_record)}"
-            )
-
-        n_variants += 1
-
-        for sample_name in original_samples:
-
-            original_gt = original_record.samples[sample_name].get("GT")
-            phased_call = phased_record.samples[sample_name]
-
-            if is_missing(original_gt):
-
-                phased_gt = phased_call.get("GT")
-
-                # Restore missing genotype, including ploidy.
-                phased_call["GT"] = tuple(
-                    None for _ in original_gt
-                )
-
-                phased_call.phased = False
-
-                if not is_missing(phased_gt):
-                    restored += 1
-
-            else:
-
-                # Preserve Beagle's phased genotype.
-                #
-                # Also verify that Beagle did not change
-                # the observed genotype's allele counts.
-
-                phased_gt = phased_call.get("GT")
-
-                if is_missing(phased_gt):
-                    raise RuntimeError(
-                        "Beagle produced a missing genotype "
-                        "where the filtered input was observed: "
-                        f"{sample_name}, "
-                        f"{variant_key(original_record)}"
-                    )
-
-                if sorted(original_gt) != sorted(phased_gt):
-                    raise RuntimeError(
-                        "Beagle changed an observed genotype: "
-                        f"{sample_name}, "
-                        f"{variant_key(original_record)}"
-                    )
-
-                retained += 1
-
-        outvcf.write(phased_record)
-
-    original.close()
-    phased.close()
-    outvcf.close()
-
-    print("Missingness restoration completed.")
-    print(f"Variants checked: {n_variants}")
-    print(f"Observed genotypes retained: {retained}")
-    print(f"Beagle-filled genotypes masked again: {restored}")
-
-
-def main():
-
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "mode",
-        choices=["filter", "restore"]
-    )
-
-    parser.add_argument("--input")
-    parser.add_argument("--filtered")
-    parser.add_argument("--phased")
-
-    parser.add_argument("--output", required=True)
-
-    parser.add_argument("--min-dp", type=int, default=10)
-    parser.add_argument("--min-gq", type=int, default=30)
-
-    args = parser.parse_args()
-
-    if args.mode == "filter":
-
-        filter_genotypes(
-            args.input,
-            args.output,
-            args.min_dp,
-            args.min_gq
-        )
-
-    elif args.mode == "restore":
-
-        restore_missingness(
-            args.filtered,
-            args.phased,
-            args.output
-        )
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as error:
-        print(f"ERROR: {error}", file=sys.stderr)
-        sys.exit(1)
-
+def filter_calls(src, dest, min_dp, min_gq):
+    with pysam.VariantFile(src) as inp:
+        out = pysam.VariantFile(dest, 'wz', header=inp.header.copy())
+        try:
+            samples = list(inp.header.samples)
+            counts = dict(total=0, original_missing=0, low_dp=0, low_gq=0)
+            for rec in inp:
+                for sample in samples:
+                    call = rec.samples[sample]
+                    gt = call.get('GT')
+                    counts['total'] += 1
+                    if missing(gt):
+                        counts['original_missing'] += 1
+                        continue
+                    dp = call.get('DP')
+                    if dp is None or dp < min_dp:
+                        call['GT'] = (None,) * len(gt)
+                        call.phased = False
+                        counts['low_dp'] += 1
+                    elif any(a != 0 for a in gt):
+                        gq = call.get('GQ')
+                        if gq is None or gq < min_gq:
+                            call['GT'] = (None,) * len(gt)
+                            call.phased = False
+                            counts['low_gq'] += 1
+                out.write(rec)
+        finally:
+            out.close()
+    print('Filtering:', counts, flush=True)
+
+
+def restore(src, beagle, dest):
+    with pysam.VariantFile(src) as original, pysam.VariantFile(beagle) as phased:
+        samples = list(original.header.samples)
+        if samples != list(phased.header.samples):
+            raise ValueError('Filtered and Beagle sample names/order differ')
+
+        header = phased.header.copy()
+        for name in original.header.contigs:
+            if name not in header.contigs:
+                contig = original.header.contigs[name]
+                if contig.length is None:
+                    header.contigs.add(name)
+                else:
+                    header.contigs.add(name, length=contig.length)
+
+        restored = 0
+        retained = 0
+        variants = 0
+        with pysam.VariantFile(dest, 'wz', header=header) as out:
+            for orig, phase in zip_longest(original, phased):
+                if orig is None or phase is None:
+                    raise ValueError('Filtered and Beagle record counts differ')
+                if key(orig) != key(phase):
+                    raise ValueError(f'Variant mismatch: {key(orig)} vs {key(phase)}')
+                variants += 1
+                for sample in samples:
+                    gt = orig.samples[sample].get('GT')
+                    call = phase.samples[sample]
+                    phased_gt = call.get('GT')
+                    if missing(gt):
+                        if not missing(phased_gt):
+                            restored += 1
+                        call['GT'] = (None,) * (len(gt) if gt is not None else 2)
+                        call.phased = False
+                    else:
+                        if missing(phased_gt) or sorted(gt) != sorted(phased_gt):
+                            raise ValueError(f'Observed genotype changed at {key(orig)}, {sample}')
+                        retained += 1
+                phase.translate(header)
+                out.write(phase)
+                if variants % 100000 == 0:
+                    print(f'Restored {variants:,} variant records', flush=True)
+    print(f'Restoration complete: {variants:,} variants, {retained:,} retained, {restored:,} Beagle-filled masked', flush=True)
+
+
+if __name__ == '__main__':
+    p = argparse.ArgumentParser()
+    p.add_argument('mode', choices=['filter', 'restore'])
+    p.add_argument('--input')
+    p.add_argument('--filtered')
+    p.add_argument('--phased')
+    p.add_argument('--output', required=True)
+    p.add_argument('--min-dp', type=int, default=10)
+    p.add_argument('--min-gq', type=int, default=30)
+    a = p.parse_args()
+    if a.mode == 'filter':
+        filter_calls(a.input, a.output, a.min_dp, a.min_gq)
+    else:
+        restore(a.filtered, a.phased, a.output)
 PYTHON
+
+python3.11 -m py_compile "$HELPER"
 
 # =========================================================
 # 7. FILTER GENOTYPES BEFORE PHASING
@@ -496,12 +357,18 @@ echo "Beagle phasing completed."
 
 echo "Restoring missing genotypes..."
 
+# Stage output in task-specific directory; publish only after validation.
+TEMP_PHASED="${TMPDIR_SAMPLE}/phased.vcf.gz"
 python3.11 "$HELPER" restore \
     --filtered "${PREFIX}.filtered.vcf.gz" \
     --phased "${PREFIX}.beagle.vcf.gz" \
-    --output "${PREFIX}.phased.vcf.gz"
+    --output "$TEMP_PHASED"
 
-bcftools index -t "${PREFIX}.phased.vcf.gz"
+bcftools index -t "$TEMP_PHASED"
+[[ $(bcftools query -l "$TEMP_PHASED" | wc -l) -eq ${#samples[@]} ]] || { echo "Incorrect sample count" >&2; exit 1; }
+[[ $(bcftools index -n "$TEMP_PHASED") -eq $(bcftools index -n "${PREFIX}.filtered.vcf.gz") ]] || { echo "Incorrect variant count" >&2; exit 1; }
+mv -f "$TEMP_PHASED" "${PREFIX}.phased.vcf.gz"
+mv -f "${TEMP_PHASED}.tbi" "${PREFIX}.phased.vcf.gz.tbi"
 
 echo "Final phased VCF created:"
 echo "${PREFIX}.phased.vcf.gz"
@@ -515,11 +382,12 @@ echo "Parsing phased VCF..."
 # DP and GQ filtering were already performed.
 # Do not repeat these filters after Beagle.
 
-/data/leuven/357/vsc35707/miniconda3/bin/python3.11 \
-    parseVCF.py \
+python3.11 "${BASE_DIR}/parseVCF.py" \
     --skipIndels \
     -i "${PREFIX}.phased.vcf.gz" \
-    | gzip -c > "${PREFIX}.calls.gz"
+    | gzip -c > "${TMPDIR_SAMPLE}/calls.gz"
+gzip -t "${TMPDIR_SAMPLE}/calls.gz"
+mv -f "${TMPDIR_SAMPLE}/calls.gz" "${PREFIX}.calls.gz"
 
 echo "Calls file created:"
 echo "${PREFIX}.calls.gz"
@@ -538,7 +406,9 @@ awk -v OFS="\t" 'NR==1 {
     }
 }
 { print }
-' | gzip -c > "${OUT_DIR}/${REFNAME}.chr_${CHR_NUM}.H.calls.gz"
+' | gzip -c > "${TMPDIR_SAMPLE}/H.calls.gz"
+gzip -t "${TMPDIR_SAMPLE}/H.calls.gz"
+mv -f "${TMPDIR_SAMPLE}/H.calls.gz" "${OUT_DIR}/${REFNAME}.chr_${CHR_NUM}.H.calls.gz"
 
 echo "Final calls file:"
 echo "${OUT_DIR}/${REFNAME}.chr_${CHR_NUM}.H.calls.gz"
@@ -546,8 +416,6 @@ echo "${OUT_DIR}/${REFNAME}.chr_${CHR_NUM}.H.calls.gz"
 # =========================================================
 # 12. CLEAN UP TEMPORARY HELPER
 # =========================================================
-
-rm -rf -- "$TMPDIR_SAMPLE"
 
 echo "======================================"
 echo "FINISHED CHROMOSOME $CHROM"
