@@ -2,12 +2,12 @@
 #SBATCH --cluster=wice
 #SBATCH --job-name=call_snps
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=36
-#SBATCH --mem=48G
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=72G
 #SBATCH --time=72:00:00
 #SBATCH -A lp_svbelleghem
 #SBATCH -o /scratch/leuven/357/vsc35707/popgen/scripts/logs/call_snps.%A_%a.out
-#SBATCH --array=1-11
+#SBATCH --array=1-11%3
 
 set -euo pipefail
 
@@ -479,12 +479,14 @@ echo "${PREFIX}.filtered.vcf.gz"
 
 echo "Phasing $CHROM with Beagle..."
 
-java -Xmx32g \
+java -Xmx64g \
     -jar /data/leuven/357/vsc35707/beagle.27Feb25.75f.jar \
     gt="${PREFIX}.filtered.vcf.gz" \
     out="${PREFIX}.beagle" \
-    nthreads="$THREADS" \
-    impute=false
+    nthreads=12 \
+    impute=false \
+    window=5.0 \
+    overlap=1.0
 
 echo "Beagle phasing completed."
 
