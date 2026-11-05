@@ -119,6 +119,14 @@ if [[ ! -s "$REF" || ! -s "${REF}.fai" ]]; then
     exit 1
 fi
 
+if ! awk -v chr="$CHROM" '
+    $1 == chr {found=1}
+    END {exit !found}
+' "${REF}.fai"; then
+    echo "ERROR: $CHROM missing from reference index." >&2
+    exit 1
+fi
+
 ALL_LIST=()
 
 for SAMPLE in "${samples[@]}"; do
@@ -434,8 +442,12 @@ bcftools reheader \
 
 # Check that the chromosome definition exists.
 
-bcftools view -h "$FIXED_BEAGLE" |
-    grep -F "##contig=<ID=${CHROM}," > /dev/null
+if ! bcftools view -h "$FIXED_BEAGLE" |
+    grep -F "##contig=<ID=${CHROM}," > /dev/null; then
+
+    echo "ERROR: Missing contig definition for $CHROM" >&2
+    exit 1
+fi
 
 # Index repaired Beagle output.
 
@@ -539,6 +551,17 @@ awk -v OFS="\t" 'NR==1 {
 { print }
 ' | gzip -c > "${TMPDIR_SAMPLE}/H.calls.gz"
 gzip -t "${TMPDIR_SAMPLE}/H.calls.gz"
+
+H_LINES=$(gzip -cd "${TMPDIR_SAMPLE}/H.calls.gz" |
+    awk 'END {print NR}')
+
+if [[ "$H_LINES" -le 1 ]]; then
+    echo "ERROR: H calls file contains no variant data." >&2
+    exit 1
+fi
+
+echo "H calls lines: $H_LINES"
+
 mv -f "${TMPDIR_SAMPLE}/H.calls.gz" "${OUT_DIR}/${REFNAME}.chr_${CHR_NUM}.H.calls.gz"
 
 echo "Final calls file:"
