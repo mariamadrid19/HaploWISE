@@ -49,6 +49,14 @@ CHR_NUM=$((ID + 1))
 
 PREFIX="${VCF_DIR}/${REFNAME}.chr_${CHR_NUM}"
 
+FINAL="${OUT_DIR}/${REFNAME}.chr_${CHR_NUM}.H.calls.gz"
+
+if [[ -s "$FINAL" ]] && gzip -t "$FINAL" 2>/dev/null; then
+    echo "$CHROM already has a valid compressed H calls file."
+    echo "Skipping to avoid overwriting existing results."
+    exit 0
+fi
+
 # Filtering thresholds
 MIN_DP=10
 MIN_GQ=30
@@ -138,6 +146,11 @@ done
 
 echo "BAM files found: ${#ALL_LIST[@]}"
 
+if [[ "${#ALL_LIST[@]}" -ne 123 ]]; then
+    echo "ERROR: Expected 123 BAM files." >&2
+    exit 1
+fi
+
 # =========================================================
 # 4. CALL VARIANTS
 # =========================================================
@@ -225,7 +238,7 @@ def missing(gt):
 
 def filter_calls(src, dest, min_dp, min_gq):
     with pysam.VariantFile(src) as inp:
-        out = pysam.VariantFile(dest, 'wz', header=inp.header.copy())
+        out = pysam.VariantFile(dest, 'wz', header=inp.header)
         try:
             samples = list(inp.header.samples)
             counts = dict(total=0, original_missing=0, low_dp=0, low_gq=0)
@@ -255,49 +268,101 @@ def filter_calls(src, dest, min_dp, min_gq):
 
 
 def restore(src, beagle, dest):
-    with pysam.VariantFile(src) as original, pysam.VariantFile(beagle) as phased:
-        samples = list(original.header.samples)
-        if samples != list(phased.header.samples):
-            raise ValueError('Filtered and Beagle sample names/order differ')
 
-        header = phased.header.copy()
-        for name in original.header.contigs:
-            if name not in header.contigs:
-                contig = original.header.contigs[name]
-                if contig.length is None:
-                    header.contigs.add(name)
-                else:
-                    header.contigs.add(name, length=contig.length)
+    # The Beagle header has already been repaired
+    # with bcftools reheader before this function.
+
+    with pysam.VariantFile(src) as original, \
+         pysam.VariantFile(beagle) as phased:
+
+        samples = list(original.header.samples)
+
+        if samples != list(phased.header.samples):
+            raise ValueError(
+                "Filtered and Beagle sample names/order differ"
+            )
+
+        if len(samples) != 123:
+            raise ValueError(
+                f"Expected 123 samples, found {len(samples)}"
+            )
+
+        header = phased.header
 
         restored = 0
+        already_missing = 0
         retained = 0
         variants = 0
-        with pysam.VariantFile(dest, 'wz', header=header) as out:
+
+        with pysam.VariantFile(
+            dest, 'wz', header=header
+        ) as out:
+
             for orig, phase in zip_longest(original, phased):
+
                 if orig is None or phase is None:
-                    raise ValueError('Filtered and Beagle record counts differ')
+                    raise ValueError(
+                        "Filtered and Beagle record counts differ"
+                    )
+
                 if key(orig) != key(phase):
-                    raise ValueError(f'Variant mismatch: {key(orig)} vs {key(phase)}')
+                    raise ValueError(
+                        f"Variant mismatch: {key(orig)} vs {key(phase)}"
+                    )
+
                 variants += 1
+
                 for sample in samples:
+
                     gt = orig.samples[sample].get('GT')
                     call = phase.samples[sample]
                     phased_gt = call.get('GT')
-                    if missing(gt):
-                        if not missing(phased_gt):
-                            restored += 1
-                        call['GT'] = (None,) * (len(gt) if gt is not None else 2)
-                        call.phased = False
-                    else:
-                        if missing(phased_gt) or sorted(gt) != sorted(phased_gt):
-                            raise ValueError(f'Observed genotype changed at {key(orig)}, {sample}')
-                        retained += 1
-                phase.translate(header)
-                out.write(phase)
-                if variants % 100000 == 0:
-                    print(f'Restored {variants:,} variant records', flush=True)
-    print(f'Restoration complete: {variants:,} variants, {retained:,} retained, {restored:,} Beagle-filled masked', flush=True)
 
+                    if missing(gt):
+
+                        if missing(phased_gt):
+                            already_missing += 1
+                        else:
+                            restored += 1
+
+                        ploidy = len(gt) if gt is not None else 2
+
+                        call['GT'] = (None,) * ploidy
+                        call.phased = False
+
+                    else:
+
+                        if missing(phased_gt):
+                            raise ValueError(
+                                f"Observed genotype missing at "
+                                f"{key(orig)}, {sample}"
+                            )
+
+                        if sorted(gt) != sorted(phased_gt):
+                            raise ValueError(
+                                f"Observed genotype changed at "
+                                f"{key(orig)}, {sample}"
+                            )
+
+                        retained += 1
+
+                # Input records and output use the
+                # same repaired Beagle header.
+                out.write(phase)
+
+                if variants % 100000 == 0:
+                    print(
+                        f"Restored {variants:,} variant records",
+                        flush=True
+                    )
+
+        print(
+            f"Restoration complete: {variants:,} variants, "
+            f"{retained:,} observed retained, "
+            f"{restored:,} Beagle-filled masked, "
+            f"{already_missing:,} already missing",
+            flush=True
+        )
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
@@ -352,26 +417,92 @@ java -Xmx64g \
 echo "Beagle phasing completed."
 
 # =========================================================
-# 9. RESTORE ORIGINAL MISSINGNESS
+# 9. REPAIR BEAGLE HEADER AND RESTORE MISSINGNESS
 # =========================================================
+
+echo "Repairing Beagle VCF header..."
+
+# Beagle can omit ##contig definitions.
+# Repair the header before pysam reads variant records.
+
+FIXED_BEAGLE="${TMPDIR_SAMPLE}/beagle.fixed.vcf.gz"
+
+bcftools reheader \
+    -f "${REF}.fai" \
+    -o "$FIXED_BEAGLE" \
+    "${PREFIX}.beagle.vcf.gz"
+
+# Check that the chromosome definition exists.
+
+bcftools view -h "$FIXED_BEAGLE" |
+    grep -F "##contig=<ID=${CHROM}," > /dev/null
+
+# Index repaired Beagle output.
+
+bcftools index -f -t "$FIXED_BEAGLE"
+
+# Validate variant counts before restoration.
+
+N_FILTERED=$(bcftools index -n "${PREFIX}.filtered.vcf.gz")
+N_BEAGLE=$(bcftools index -n "$FIXED_BEAGLE")
+
+if [[ "$N_FILTERED" -ne "$N_BEAGLE" ]]; then
+    echo "ERROR: Filtered and Beagle variant counts differ." >&2
+    exit 1
+fi
+
+# Validate sample names and order.
+
+bcftools query -l "${PREFIX}.filtered.vcf.gz" \
+    > "${TMPDIR_SAMPLE}/filtered.samples"
+
+bcftools query -l "$FIXED_BEAGLE" \
+    > "${TMPDIR_SAMPLE}/beagle.samples"
+
+if ! cmp -s \
+    "${TMPDIR_SAMPLE}/filtered.samples" \
+    "${TMPDIR_SAMPLE}/beagle.samples"; then
+
+    echo "ERROR: Sample names/order differ." >&2
+    exit 1
+fi
+
+echo "Beagle VCF validated."
+
+# Restore original missingness.
 
 echo "Restoring missing genotypes..."
 
-# Stage output in task-specific directory; publish only after validation.
 TEMP_PHASED="${TMPDIR_SAMPLE}/phased.vcf.gz"
+
 python3.11 "$HELPER" restore \
     --filtered "${PREFIX}.filtered.vcf.gz" \
-    --phased "${PREFIX}.beagle.vcf.gz" \
+    --phased "$FIXED_BEAGLE" \
     --output "$TEMP_PHASED"
 
-bcftools index -t "$TEMP_PHASED"
-[[ $(bcftools query -l "$TEMP_PHASED" | wc -l) -eq ${#samples[@]} ]] || { echo "Incorrect sample count" >&2; exit 1; }
-[[ $(bcftools index -n "$TEMP_PHASED") -eq $(bcftools index -n "${PREFIX}.filtered.vcf.gz") ]] || { echo "Incorrect variant count" >&2; exit 1; }
+# Index and validate final phased VCF.
+
+bcftools index -f -t "$TEMP_PHASED"
+
+N_FINAL=$(bcftools index -n "$TEMP_PHASED")
+N_SAMPLES=$(bcftools query -l "$TEMP_PHASED" | wc -l)
+
+if [[ "$N_FINAL" -ne "$N_FILTERED" ]]; then
+    echo "ERROR: Final variant count mismatch." >&2
+    exit 1
+fi
+
+if [[ "$N_SAMPLES" -ne 123 ]]; then
+    echo "ERROR: Expected 123 samples." >&2
+    exit 1
+fi
+
 mv -f "$TEMP_PHASED" "${PREFIX}.phased.vcf.gz"
 mv -f "${TEMP_PHASED}.tbi" "${PREFIX}.phased.vcf.gz.tbi"
 
-echo "Final phased VCF created:"
+echo "Phased VCF created:"
 echo "${PREFIX}.phased.vcf.gz"
+
 
 # =========================================================
 # 10. PARSE PHASED VCF
